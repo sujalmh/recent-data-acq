@@ -152,7 +152,9 @@ async def scrape_and_download(date):
     async with AsyncWebCrawler() as crawler:
         for url in URLS:
             try:
+                await crawler.start()
                 await extract_pdfs_from_url(url, conn, crawler, date)
+                await crawler.close()
             except Exception as e:
                 logging.warning(f"⚠️ Error crawling {url}: {e}")
     conn.close()
