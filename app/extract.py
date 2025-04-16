@@ -1,46 +1,48 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, Query, File, Form, Depends, HTTPException
+from pydantic import Field, BaseModel
+from typing import Optional, List
 from datetime import datetime, timedelta
-import hashlib, sqlite3, os, requests, logging, asyncio
-
+import hashlib, sqlite3, sys, os, requests, logging, asyncio
 from crawl4ai import *
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from pydantic import Field
-from typing import List
-import sys
-
 from pymilvus import connections, utility, FieldSchema, CollectionSchema, DataType, Collection
-import logging
-
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
-import os
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Milvus
-from pymilvus import connections, utility, FieldSchema, CollectionSchema, DataType, Collection
 import logging
+import httpx
 
-from typing import Optional
-from fastapi import Query
+from dotenv import load_dotenv
+load_dotenv()
 
 if sys.platform.startswith('win'):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-import logging
-
-from dotenv import load_dotenv
-load_dotenv()
-# Set up logging
-
 logging.basicConfig(filename="logs.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from pymilvus import connections
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: connect to Milvus
+    connections.connect("default", host="localhost", port="19530")
+    print("Connected to Milvus.")
+
+    yield  # Application runs during this time
+
+    # Shutdown: disconnect from Milvus
+    connections.disconnect("default")
+    print("Disconnected from Milvus.")
+
+
+app = FastAPI(lifespan=lifespan)
+
 
 API_KEY = os.getenv("RD_API_KEY")
 API_KEY_NAME = "access_token"
@@ -56,16 +58,18 @@ PDF_SAVE_DIR = "pdfs"
 URLS = [
     "https://www.rbi.org.in/Scripts/NotificationUser.aspx",
     "https://www.rbi.org.in/Scripts/HalfYearlyPublications.aspx?head=Monetary%20Policy%20Report",
-    # "https://www.rbi.org.in/Scripts/Publications.aspx?publication=Bimonthly",
-    # "https://www.rbi.org.in/Scripts/AnnualPublications.aspx?head=Handbook%20of%20Statistics%20on%20Indian%20Economy",
-    # "https://www.rbi.org.in/Scripts/AnnualPublications.aspx?head=Handbook%20of%20Statistics%20on%20Indian%20States"
+    "https://www.rbi.org.in/Scripts/BimonthlyPublications.aspx?head=Survey%20of%20Professional%20Forecasters%20-%20Bi-monthly",
+    "https://www.rbi.org.in/Scripts/BimonthlyPublications.aspx?head=Inflation%20Expectations%20Survey%20of%20Households%20-%20Bi-monthly",
+    "https://www.rbi.org.in/Scripts/BimonthlyPublications.aspx?head=Consumer%20Confidence%20Survey%20-%20Bi-monthly",
+    "https://www.rbi.org.in/Scripts/BimonthlyPublications.aspx?head=Rural%20Consumer%20Confidence%20Survey%20-%20Bi-monthly",
+    "https://www.rbi.org.in/Scripts/AnnualPublications.aspx?head=Handbook%20of%20Statistics%20on%20Indian%20Economy",
+    "https://www.rbi.org.in/Scripts/AnnualPublications.aspx?head=Handbook%20of%20Statistics%20on%20Indian%20States"
 ]
 
 class PDFLinkOutput(BaseModel):
     pdf_links: List[str] = Field(description="List of PDF URLs updated or posted yesterday")
 
 def get_relevant_links_from_markdown(markdown_text, date):
-    print(type(date))
     splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200)
     chunks = splitter.split_text(markdown_text)
 
@@ -120,9 +124,10 @@ def save_pdf_metadata(conn, url, content, path):
     )
     conn.commit()
 
-def download_pdf(conn, url):
+async def download_pdf(conn, url):
     try:
-        response = requests.get(url, timeout=15)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=15)
         if response.status_code == 200 and not has_been_downloaded(conn, url):
             os.makedirs(PDF_SAVE_DIR, exist_ok=True)
             filename = os.path.join(PDF_SAVE_DIR, os.path.basename(url))
@@ -134,7 +139,9 @@ def download_pdf(conn, url):
         logging.error(f"❌ Failed to download {url}: {e}")
 
 async def extract_pdfs_from_url(url, conn, crawler, date):
+    await crawler.start()
     result = await crawler.arun(url=url)
+    await crawler.close()
     markdown_text = result.markdown
 
     relevant_links = get_relevant_links_from_markdown(markdown_text, date)
@@ -144,7 +151,7 @@ async def extract_pdfs_from_url(url, conn, crawler, date):
             from urllib.parse import urljoin
             link = urljoin(url, link)
         if link:
-            download_pdf(conn, link)
+            await download_pdf(conn, link)
 
 async def scrape_and_download(date):
     conn = init_db()
@@ -152,9 +159,9 @@ async def scrape_and_download(date):
     async with AsyncWebCrawler() as crawler:
         for url in URLS:
             try:
-                await crawler.start()
+                
                 await extract_pdfs_from_url(url, conn, crawler, date)
-                await crawler.close()
+                
             except Exception as e:
                 logging.warning(f"⚠️ Error crawling {url}: {e}")
     conn.close()
@@ -165,7 +172,6 @@ def sync_scrape_and_download(date):
 
 NEW_COLLECTION_NAME = "recent_pdf_embeddings"
 
-from pymilvus import utility
 
 def drop_collection(collection_name: str):
     connections.connect(host="localhost", port="19530")
@@ -176,20 +182,24 @@ def drop_collection(collection_name: str):
 
 
 def setup_collection(collection_name: str):
-    connections.connect(host="localhost", port="19530")
-
     if utility.has_collection(collection_name):
-        return  # Collection already exists
+        return
 
-    # Added page_content field to store text chunks
+    index_params = {
+        "index_type": "IVF_FLAT",
+        "metric_type": "L2",
+        "params": {"nlist": 128}
+    }
+
     fields = [
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1536),
+        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, index_params=index_params, dim=1536),
         FieldSchema(name="page_content", dtype=DataType.VARCHAR, max_length=65535),
     ]
 
     schema = CollectionSchema(fields=fields, description="PDF Embedding Collection")
     Collection(name=collection_name, schema=schema)
+
 
 @app.post("/index", dependencies=[Depends(verify_api_key)])
 def reindex_new_pdfs():
@@ -198,7 +208,6 @@ def reindex_new_pdfs():
     conn = sqlite3.connect(PDF_URLS_DB)
     cursor = conn.cursor()
 
-    # Select only PDFs that are not indexed
     try:
         cursor.execute("SELECT url, hash, path FROM pdfs WHERE indexed = 0")
     except sqlite3.Error as e:
@@ -215,19 +224,15 @@ def reindex_new_pdfs():
         pdf_filename = path
         if not os.path.exists(pdf_filename):
             continue
-
         try:
             loader = PyPDFLoader(pdf_filename)
             docs = loader.load()
             splits = text_splitter.split_documents(docs)
 
             for doc in splits:
-                # Add page_content to metadata so Milvus can use it
                 doc.metadata["page_content"] = doc.page_content
 
             all_splits.extend(splits)
-
-            # Mark as indexed
             cursor.execute("UPDATE pdfs SET indexed = 1 WHERE hash = ?", (pdf_hash,))
         except Exception as e:
             print(f"Failed to process {url}: {e}")
@@ -237,23 +242,25 @@ def reindex_new_pdfs():
     conn.close()
 
     if all_splits:
-        Milvus.from_documents(
-            documents=all_splits,
-            embedding=OpenAIEmbeddings(),
-            collection_name=NEW_COLLECTION_NAME,
-            connection_args={"host": "localhost", "port": "19530"},
-            vector_field="embedding",
-            text_field="page_content",
-        )
+        batch_size = 500
+        for i in range(0, len(all_splits), batch_size):
+            batch = all_splits[i:i + batch_size]
+            try:
+                Milvus.from_documents(
+                    documents=batch,
+                    embedding=OpenAIEmbeddings(),
+                    collection_name=NEW_COLLECTION_NAME,
+                    connection_args=None,
+                    vector_field="embedding",
+                    text_field="page_content",
+                )
+            except Exception as e:
+                conn.rollback()
+                return {"message": f"Failed to insert batch {i}: {e}"}
         return {"message": f"Indexed {len(all_splits)} chunks into {NEW_COLLECTION_NAME}."}
     else:
         return {"message": "No new PDFs to index."}
 
-from fastapi import Form, Depends
-from fastapi.responses import JSONResponse
-from pymilvus import utility, Collection
-from langchain.vectorstores import Milvus
-from langchain.embeddings.openai import OpenAIEmbeddings
 
 @app.post("/ask", dependencies=[Depends(verify_api_key)])
 async def ask_question_new(
@@ -263,13 +270,11 @@ async def ask_question_new(
         return JSONResponse(status_code=400, content={"error": "No documents uploaded yet."})
 
     setup_collection(NEW_COLLECTION_NAME)
-
-    connections.connect(host="localhost", port="19530")
-
+    
     vectorstore = Milvus(
         embedding_function=OpenAIEmbeddings(),
         collection_name=NEW_COLLECTION_NAME,
-        connection_args={"host": "localhost", "port": "19530"},
+        connection_args=None,
         vector_field="embedding",
         text_field="page_content",
     )
