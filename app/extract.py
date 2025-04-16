@@ -102,17 +102,22 @@ def init_db():
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS pdfs (
         url TEXT PRIMARY KEY,
-        hash TEXT
+        hash TEXT,
+        indexed BOOLEAN DEFAULT 0,
+        path TEXT
     )""")
     conn.commit()
-    return conn
+    return conn 
 
 def has_been_downloaded(conn, url):
     return conn.execute("SELECT 1 FROM pdfs WHERE url = ?", (url,)).fetchone()
 
-def save_pdf_metadata(conn, url, content):
+def save_pdf_metadata(conn, url, content, path):
     hash_digest = hashlib.sha256(content).hexdigest()
-    conn.execute("INSERT OR IGNORE INTO pdfs (url, hash) VALUES (?, ?)", (url, hash_digest))
+    conn.execute(
+        "INSERT OR IGNORE INTO pdfs (url, hash, indexed, path) VALUES (?, ?, ?, ?)",
+        (url, hash_digest, False, path)
+    )
     conn.commit()
 
 def download_pdf(conn, url):
@@ -123,7 +128,7 @@ def download_pdf(conn, url):
             filename = os.path.join(PDF_SAVE_DIR, os.path.basename(url))
             with open(filename, "wb") as f:
                 f.write(response.content)
-            save_pdf_metadata(conn, url, response.content)
+            save_pdf_metadata(conn, url, response.content, filename)
             logging.info(f"✅ Downloaded: {filename}")
     except Exception as e:
         logging.error(f"❌ Failed to download {url}: {e}")
@@ -158,47 +163,55 @@ def sync_scrape_and_download(date):
 
 NEW_COLLECTION_NAME = "recent_pdf_embeddings"
 
-def setup_collection(collection_name: str):
+from pymilvus import utility
+
+def drop_collection(collection_name: str):
     connections.connect(host="localhost", port="19530")
     
     if utility.has_collection(collection_name):
         utility.drop_collection(collection_name)
+        print(f"Dropped existing collection: {collection_name}")
 
+
+def setup_collection(collection_name: str):
+    connections.connect(host="localhost", port="19530")
+
+    if utility.has_collection(collection_name):
+        return  # Collection already exists
+
+    # Added page_content field to store text chunks
     fields = [
-        FieldSchema(
-            name="id",
-            dtype=DataType.INT64,
-            is_primary=True,
-            auto_id=True 
-        ),
+        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
         FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1536),
-        FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=256)
+        FieldSchema(name="page_content", dtype=DataType.VARCHAR, max_length=65535),
     ]
+
     schema = CollectionSchema(fields=fields, description="PDF Embedding Collection")
     Collection(name=collection_name, schema=schema)
 
 @app.post("/index", dependencies=[Depends(verify_api_key)])
 def reindex_new_pdfs():
-    # Step 1: Setup collection in Milvus
     setup_collection(NEW_COLLECTION_NAME)
 
-    # Step 2: Connect to SQLite and get new PDFs
     conn = sqlite3.connect(PDF_URLS_DB)
     cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS embedded_pdfs (hash TEXT PRIMARY KEY)")
-    
-    cursor.execute("SELECT url, hash FROM pdfs")
+
+    cursor.execute("""CREATE TABLE IF NOT EXISTS pdfs (
+        url TEXT PRIMARY KEY,
+        hash TEXT,
+        indexed BOOLEAN DEFAULT 0,
+        path TEXT
+    )""")
+
+    # Select only PDFs that are not indexed
+    cursor.execute("SELECT url, hash, path FROM pdfs WHERE indexed = 0")
     pdf_entries = cursor.fetchall()
-    print(pdf_entries)
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     all_splits = []
 
-    for url, pdf_hash in pdf_entries:
-        cursor.execute("SELECT 1 FROM embedded_pdfs WHERE hash=?", (pdf_hash,))
-        if cursor.fetchone():
-            continue
-
-        pdf_filename = os.path.join(PDF_SAVE_DIR, hashlib.sha256(pdf_hash.encode()).hexdigest() + ".pdf")
+    for url, pdf_hash, path in pdf_entries:
+        pdf_filename = path
         if not os.path.exists(pdf_filename):
             continue
 
@@ -208,10 +221,13 @@ def reindex_new_pdfs():
             splits = text_splitter.split_documents(docs)
 
             for doc in splits:
-                doc.metadata["source"] = os.path.basename(pdf_filename)
+                # Add page_content to metadata so Milvus can use it
+                doc.metadata["page_content"] = doc.page_content
 
             all_splits.extend(splits)
-            cursor.execute("INSERT OR IGNORE INTO embedded_pdfs (hash) VALUES (?)", (pdf_hash,))
+
+            # Mark as indexed
+            cursor.execute("UPDATE pdfs SET indexed = 1 WHERE hash = ?", (pdf_hash,))
         except Exception as e:
             print(f"Failed to process {url}: {e}")
             continue
@@ -225,7 +241,8 @@ def reindex_new_pdfs():
             embedding=OpenAIEmbeddings(),
             collection_name=NEW_COLLECTION_NAME,
             connection_args={"host": "localhost", "port": "19530"},
-            vector_field="embedding"
+            vector_field="embedding",
+            text_field="page_content",
         )
         return {"message": f"Indexed {len(all_splits)} chunks into {NEW_COLLECTION_NAME}."}
     else:
@@ -241,29 +258,32 @@ from langchain.embeddings.openai import OpenAIEmbeddings
 async def ask_question_new(
     question: str = Form(...)
 ):
-    NEW_COLLECTION_NAME = "pdf_embeddings_v2"
-
     if not utility.has_collection(NEW_COLLECTION_NAME):
         return JSONResponse(status_code=400, content={"error": "No documents uploaded yet."})
 
+    # Connect to Milvus
+    connections.connect(host="localhost", port="19530")
+
+    # Create the vectorstore
     vectorstore = Milvus(
         embedding_function=OpenAIEmbeddings(),
         collection_name=NEW_COLLECTION_NAME,
         connection_args={"host": "localhost", "port": "19530"},
-        vector_field="embedding"
+        vector_field="embedding",
+        text_field="page_content",
     )
 
     logger.info(f"[ASK_NEW] Query: {question}")
 
-    # Removed chat_id filtering
     retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
     top_docs = retriever.get_relevant_documents(question)
     logger.debug(f"[ASK_NEW] Retrieved {len(top_docs)} documents")
 
-    # Optional: Raw Milvus query (just showing how many docs exist now)
     collection = Collection(NEW_COLLECTION_NAME)
     collection.load()
-    raw_result = collection.query(expr="", output_fields=["chat_id", "source"])
+
+
+    raw_result = collection.query(expr="", output_fields=["page_content"], limit=5)
     logger.debug(f"[ASK_NEW] Raw Milvus query returned {len(raw_result)} entries")
 
     if not top_docs:
