@@ -196,15 +196,14 @@ def reindex_new_pdfs():
     conn = sqlite3.connect(PDF_URLS_DB)
     cursor = conn.cursor()
 
-    cursor.execute("""CREATE TABLE IF NOT EXISTS pdfs (
-        url TEXT PRIMARY KEY,
-        hash TEXT,
-        indexed BOOLEAN DEFAULT 0,
-        path TEXT
-    )""")
-
     # Select only PDFs that are not indexed
-    cursor.execute("SELECT url, hash, path FROM pdfs WHERE indexed = 0")
+    try:
+        cursor.execute("SELECT url, hash, path FROM pdfs WHERE indexed = 0")
+    except sqlite3.Error as e:
+        conn.close()
+        print(f"SQLite error: {e}")
+        return {"error": "Database query failed."}
+    
     pdf_entries = cursor.fetchall()
 
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
