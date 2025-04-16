@@ -210,22 +210,22 @@ def reindex_new_pdfs():
 
     try:
         cursor.execute("SELECT url, hash, path FROM pdfs WHERE indexed = 0")
+        pdf_entries = cursor.fetchall()
     except sqlite3.Error as e:
         conn.close()
         print(f"SQLite error: {e}")
         return {"error": "Database query failed."}
-    
-    pdf_entries = cursor.fetchall()
 
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     all_splits = []
 
     for url, pdf_hash, path in pdf_entries:
-        pdf_filename = path
-        if not os.path.exists(pdf_filename):
+        if not os.path.exists(path):
+            print(f"Missing file: {path}")
             continue
+
         try:
-            loader = PyPDFLoader(pdf_filename)
+            loader = PyPDFLoader(path)
             docs = loader.load()
             splits = text_splitter.split_documents(docs)
 
@@ -241,25 +241,32 @@ def reindex_new_pdfs():
     conn.commit()
     conn.close()
 
-    if all_splits:
-        batch_size = 500
-        for i in range(0, len(all_splits), batch_size):
-            batch = all_splits[i:i + batch_size]
-            try:
-                Milvus.from_documents(
-                    documents=batch,
-                    embedding=OpenAIEmbeddings(),
-                    collection_name=NEW_COLLECTION_NAME,
-                    connection_args=None,
-                    vector_field="embedding",
-                    text_field="page_content",
-                )
-            except Exception as e:
-                conn.rollback()
-                return {"message": f"Failed to insert batch {i}: {e}"}
-        return {"message": f"Indexed {len(all_splits)} chunks into {NEW_COLLECTION_NAME}."}
-    else:
+    if not all_splits:
         return {"message": "No new PDFs to index."}
+
+    # Initialize once
+    embedder = OpenAIEmbeddings()
+    batch_size = 100
+    total_indexed = 0
+
+    for i in range(0, len(all_splits), batch_size):
+        batch = all_splits[i:i + batch_size]
+        try:
+            Milvus.from_documents(
+                documents=batch,
+                embedding=embedder,
+                collection_name=NEW_COLLECTION_NAME,
+                connection_args=None,
+                vector_field="embedding",
+                text_field="page_content",
+            )
+            total_indexed += len(batch)
+            time.sleep(2)  # small delay to respect TPM rate
+        except Exception as e:
+            print(f"Batch {i}-{i+batch_size} failed: {e}")
+            continue
+
+    return {"message": f"Indexed {total_indexed} chunks into {NEW_COLLECTION_NAME}."}
 
 
 @app.post("/ask", dependencies=[Depends(verify_api_key)])
@@ -270,7 +277,7 @@ async def ask_question_new(
         return JSONResponse(status_code=400, content={"error": "No documents uploaded yet."})
 
     setup_collection(NEW_COLLECTION_NAME)
-    
+
     vectorstore = Milvus(
         embedding_function=OpenAIEmbeddings(),
         collection_name=NEW_COLLECTION_NAME,
