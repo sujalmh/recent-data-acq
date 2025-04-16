@@ -14,7 +14,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Milvus
 import logging
 import httpx
-
+import time
 from dotenv import load_dotenv
 load_dotenv()
 
