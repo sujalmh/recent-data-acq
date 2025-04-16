@@ -261,11 +261,11 @@ async def ask_question_new(
 ):
     if not utility.has_collection(NEW_COLLECTION_NAME):
         return JSONResponse(status_code=400, content={"error": "No documents uploaded yet."})
+
     setup_collection(NEW_COLLECTION_NAME)
-    # Connect to Milvus
+
     connections.connect(host="localhost", port="19530")
 
-    # Create the vectorstore
     vectorstore = Milvus(
         embedding_function=OpenAIEmbeddings(),
         collection_name=NEW_COLLECTION_NAME,
@@ -276,18 +276,22 @@ async def ask_question_new(
 
     logger.info(f"[ASK_NEW] Query: {question}")
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-    top_docs = retriever.get_relevant_documents(question)
-    logger.debug(f"[ASK_NEW] Retrieved {len(top_docs)} documents")
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 15})  # Fetch more to de-duplicate
+    all_docs = retriever.get_relevant_documents(question)
+    logger.debug(f"[ASK_NEW] Retrieved {len(all_docs)} documents")
 
-    collection = Collection(NEW_COLLECTION_NAME)
-    collection.load()
+    # Filter for unique page content
+    seen = set()
+    unique_docs = []
+    for doc in all_docs:
+        content = doc.page_content.strip()
+        if content not in seen:
+            seen.add(content)
+            unique_docs.append(doc)
+        if len(unique_docs) == 5:
+            break
 
-
-    raw_result = collection.query(expr="", output_fields=["page_content"], limit=5)
-    logger.debug(f"[ASK_NEW] Raw Milvus query returned {len(raw_result)} entries")
-
-    if not top_docs:
+    if not unique_docs:
         return {
             "query": question,
             "top_5_chunks": [],
@@ -301,7 +305,7 @@ async def ask_question_new(
                 "page_content": doc.page_content,
                 "metadata": doc.metadata
             }
-            for doc in top_docs
+            for doc in unique_docs
         ]
     }
 
