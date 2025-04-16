@@ -260,7 +260,7 @@ async def ask_question_new(
 ):
     if not utility.has_collection(NEW_COLLECTION_NAME):
         return JSONResponse(status_code=400, content={"error": "No documents uploaded yet."})
-
+    setup_collection(NEW_COLLECTION_NAME)
     # Connect to Milvus
     connections.connect(host="localhost", port="19530")
 
